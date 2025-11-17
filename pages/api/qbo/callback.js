@@ -1,8 +1,14 @@
+// Soglie "tipo nexus" (puoi modificarle)
+const SALES_THRESHOLD = 100000; // 100k vendite
+const ORDERS_THRESHOLD = 200;   // 200 ordini
+
 export default async function handler(req, res) {
   const { code, state, realmId } = req.query;
 
   if (!code || !realmId) {
-    return res.status(400).send("Missing code or realmId in callback query params.");
+    return res
+      .status(400)
+      .send("Missing code or realmId in callback query params.");
   }
 
   const clientId = process.env.QBO_CLIENT_ID;
@@ -14,7 +20,9 @@ export default async function handler(req, res) {
   }
 
   const tokenUrl = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer";
-  const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+  const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString(
+    "base64"
+  );
 
   const body = new URLSearchParams({
     grant_type: "authorization_code",
@@ -38,7 +46,11 @@ export default async function handler(req, res) {
     if (!tokenResp.ok) {
       res.status(500).setHeader("Content-Type", "text/html; charset=utf-8");
       return res.end(
-        `<h1>Token exchange failed</h1><pre>${JSON.stringify(tokenData, null, 2)}</pre>`
+        `<h1>Token exchange failed</h1><pre>${JSON.stringify(
+          tokenData,
+          null,
+          2
+        )}</pre>`
       );
     }
 
@@ -47,7 +59,7 @@ export default async function handler(req, res) {
     const expiresIn = tokenData.expires_in;
     const refreshExpiresIn = tokenData.x_refresh_token_expires_in;
 
-    // 2) COMPANY INFO (giusto per avere il nome da mostrare)
+    // 2) COMPANY INFO (nome da mostrare)
     const companyUrl = `https://sandbox-quickbooks.api.intuit.com/v3/company/${realmId}/companyinfo/${realmId}?minorversion=65`;
 
     const companyResp = await fetch(companyUrl, {
@@ -65,7 +77,7 @@ export default async function handler(req, res) {
     // 3) INVOICE -> MINI REPORT NEXUS (vendite per stato)
     const queryUrl = `https://sandbox-quickbooks.api.intuit.com/v3/company/${realmId}/query?minorversion=65`;
 
-    // per ora: tutte le Invoice degli ultimi 365 giorni
+    // Per ora: ultime 52 settimane (~365 giorni)
     const today = new Date();
     const oneYearAgo = new Date(today);
     oneYearAgo.setDate(today.getDate() - 365);
@@ -90,7 +102,9 @@ export default async function handler(req, res) {
     const invoicesData = await invoicesResp.json();
 
     const invoices =
-      (invoicesData.QueryResponse && invoicesData.QueryResponse.Invoice) || [];
+      (invoicesData.QueryResponse &&
+        invoicesData.QueryResponse.Invoice) ||
+      [];
 
     // 4) RAGGRUPPO PER STATO (ShipAddr.CountrySubDivisionCode)
     const totalsByState = {};
@@ -119,6 +133,28 @@ export default async function handler(req, res) {
         style: "currency",
         currency: "USD"
       });
+
+    const riskLabel = (r) => {
+      const overSales = r.sales >= SALES_THRESHOLD;
+      const overOrders = r.orders >= ORDERS_THRESHOLD;
+      if (overSales && overOrders) return "Sales & Orders";
+      if (overSales) return "Sales";
+      if (overOrders) return "Orders";
+      return "-";
+    };
+
+    const statesOverSales = rows.filter(
+      (r) => r.sales >= SALES_THRESHOLD
+    ).length;
+    const statesOverOrders = rows.filter(
+      (r) => r.orders >= ORDERS_THRESHOLD
+    ).length;
+    const statesOverEither = rows.filter(
+      (r) => r.sales >= SALES_THRESHOLD || r.orders >= ORDERS_THRESHOLD
+    ).length;
+
+    const totalSales = rows.reduce((sum, r) => sum + r.sales, 0);
+    const totalOrders = rows.reduce((sum, r) => sum + r.orders, 0);
 
     // 5) HTML PULITO
     res.status(200).setHeader("Content-Type", "text/html; charset=utf-8");
@@ -195,6 +231,49 @@ export default async function handler(req, res) {
       max-height: 300px;
       font-size: 0.8rem;
     }
+    .risk-row {
+      background: #fff5f5;
+    }
+    .risk-row td {
+      border-bottom-color: #f5c2c2;
+    }
+    .pill {
+      display: inline-block;
+      padding: 0.1rem 0.6rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .pill-none {
+      background: #e5e7eb;
+      color: #374151;
+    }
+    .pill-risk {
+      background: #fee2e2;
+      color: #b91c1c;
+    }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 0.75rem;
+      margin-top: 0.75rem;
+      font-size: 0.9rem;
+    }
+    .summary-box {
+      background: #f9fafb;
+      border-radius: 8px;
+      padding: 0.75rem 0.9rem;
+    }
+    .summary-label {
+      color: #6b7280;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      margin-bottom: 0.15rem;
+    }
+    .summary-value {
+      font-weight: 600;
+    }
   </style>
 </head>
 <body>
@@ -208,15 +287,46 @@ export default async function handler(req, res) {
     <h2>Token status</h2>
     <p class="meta">
       Access token valid for ~${Math.round(expiresIn / 60)} minutes. <br/>
-      Refresh token valid for ~${Math.round(refreshExpiresIn / (60 * 60 * 24))} days.
+      Refresh token valid for ~${Math.round(
+        refreshExpiresIn / (60 * 60 * 24)
+      )} days.
     </p>
   </div>
 
   <div class="card">
-    <h2>Sales by State (Invoice, from ${fromDate})</h2>
+    <h2>Sales Nexus Snapshot (Invoice, from ${fromDate})</h2>
+    <p class="meta">
+      Thresholds used: <strong>${formatMoney(
+        SALES_THRESHOLD
+      )}</strong> sales OR <strong>${ORDERS_THRESHOLD}</strong> orders per state.
+    </p>
+
+    <div class="summary-grid">
+      <div class="summary-box">
+        <div class="summary-label">Total sales (period)</div>
+        <div class="summary-value">${formatMoney(totalSales)}</div>
+      </div>
+      <div class="summary-box">
+        <div class="summary-label">Total orders (period)</div>
+        <div class="summary-value">${totalOrders}</div>
+      </div>
+      <div class="summary-box">
+        <div class="summary-label">States over thresholds (sales or orders)</div>
+        <div class="summary-value">${statesOverEither}</div>
+      </div>
+      <div class="summary-box">
+        <div class="summary-label">States over sales threshold</div>
+        <div class="summary-value">${statesOverSales}</div>
+      </div>
+      <div class="summary-box">
+        <div class="summary-label">States over orders threshold</div>
+        <div class="summary-value">${statesOverOrders}</div>
+      </div>
+    </div>
+
     ${
       rows.length === 0
-        ? "<p>No invoices found in the selected period.</p>"
+        ? "<p style=\"margin-top:1rem;\">No invoices found in the selected period.</p>"
         : `
     <table>
       <thead>
@@ -225,18 +335,25 @@ export default async function handler(req, res) {
           <th class="num">Orders</th>
           <th class="num">Sales</th>
           <th class="num">Avg order</th>
+          <th>Risk</th>
         </tr>
       </thead>
       <tbody>
         ${rows
           .map((r) => {
             const avg = r.orders ? r.sales / r.orders : 0;
+            const over =
+              r.sales >= SALES_THRESHOLD || r.orders >= ORDERS_THRESHOLD;
+            const rowClass = over ? ' class="risk-row"' : "";
+            const pillClass = over ? "pill pill-risk" : "pill pill-none";
+            const label = riskLabel(r);
             return `
-              <tr>
+              <tr${rowClass}>
                 <td>${r.state}</td>
                 <td class="num">${r.orders}</td>
                 <td class="num">${formatMoney(r.sales)}</td>
                 <td class="num">${formatMoney(avg)}</td>
+                <td><span class="${pillClass}">${label}</span></td>
               </tr>
             `;
           })
@@ -259,8 +376,6 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error(err);
     res.status(500).setHeader("Content-Type", "text/html; charset=utf-8");
-    return res.end(
-      `<h1>Unexpected error</h1><pre>${String(err)}</pre>`
-    );
+    return res.end(`<h1>Unexpected error</h1><pre>${String(err)}</pre>`);
   }
 }
