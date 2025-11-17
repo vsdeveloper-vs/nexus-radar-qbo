@@ -1,6 +1,6 @@
 // Soglie "tipo nexus" (puoi modificarle)
-const SALES_THRESHOLD = 100000; // 100k vendite
-const ORDERS_THRESHOLD = 200;   // 200 ordini
+const SALES_THRESHOLD = 100; // 100k vendite
+const ORDERS_THRESHOLD = 20;   // 200 ordini
 
 function decodeRangeFromState(state) {
   if (!state) return "last12";
