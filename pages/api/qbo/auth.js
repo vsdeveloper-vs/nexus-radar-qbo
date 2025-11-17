@@ -7,6 +7,16 @@ export default function handler(req, res) {
     return res.status(500).json({ error: "Missing QBO env vars" });
   }
 
+  // range può essere "last12", "ytd", "lastYear" (default last12)
+  const rangeParam = req.query.range;
+  const range = Array.isArray(rangeParam)
+    ? rangeParam[0]
+    : rangeParam || "last12";
+
+  // Mettiamo il preset dentro lo state (base64 di un piccolo JSON)
+  const statePayload = { range };
+  const state = Buffer.from(JSON.stringify(statePayload)).toString("base64");
+
   const baseUrl = "https://appcenter.intuit.com/connect/oauth2";
 
   const params = new URLSearchParams({
@@ -14,11 +24,10 @@ export default function handler(req, res) {
     redirect_uri: redirectUri,
     response_type: "code",
     scope,
-    state: "test_state_123" // in futuro lo renderemo sicuro/random
+    state
   });
 
   const authUrl = `${baseUrl}?${params.toString()}`;
 
-  // Redirect verso la schermata di login/autorizzazione Intuit
   res.redirect(authUrl);
 }
