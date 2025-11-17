@@ -2,6 +2,54 @@
 const SALES_THRESHOLD = 100000; // 100k vendite
 const ORDERS_THRESHOLD = 200;   // 200 ordini
 
+function decodeRangeFromState(state) {
+  if (!state) return "last12";
+  try {
+    const json = JSON.parse(Buffer.from(state, "base64").toString("utf8"));
+    return json.range || "last12";
+  } catch {
+    return "last12";
+  }
+}
+
+function computeDateRange(range) {
+  const today = new Date();
+  let from, to;
+
+  // normalizziamo a YYYY-MM-DD
+  const toDateStr = (d) => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}`;
+  };
+
+  if (range === "ytd") {
+    // Year-to-date: 1 gennaio anno corrente -> oggi
+    const fromDate = new Date(today.getFullYear(), 0, 1);
+    from = toDateStr(fromDate);
+    to = toDateStr(today);
+    return { from, to, label: "Year-to-Date (YTD)" };
+  }
+
+  if (range === "lastYear") {
+    // Last calendar year: 1 gen anno precedente -> 31 dic anno precedente
+    const year = today.getFullYear() - 1;
+    const fromDate = new Date(year, 0, 1);
+    const toDate = new Date(year, 11, 31);
+    from = toDateStr(fromDate);
+    to = toDateStr(toDate);
+    return { from, to, label: `Last calendar year (${year})` };
+  }
+
+  // Default: Last 12 months (365 giorni indietro)
+  const fromDate = new Date(today);
+  fromDate.setDate(today.getDate() - 365);
+  from = toDateStr(fromDate);
+  to = toDateStr(today);
+  return { from, to, label: "Last 12 months" };
+}
+
 export default async function handler(req, res) {
   const { code, state, realmId } = req.query;
 
@@ -10,6 +58,10 @@ export default async function handler(req, res) {
       .status(400)
       .send("Missing code or realmId in callback query params.");
   }
+
+  const range = decodeRangeFromState(state);
+  const { from: fromDate, to: toDate, label: rangeLabel } =
+    computeDateRange(range);
 
   const clientId = process.env.QBO_CLIENT_ID;
   const clientSecret = process.env.QBO_CLIENT_SECRET;
@@ -74,57 +126,64 @@ export default async function handler(req, res) {
     const companyInfo = companyData.CompanyInfo || {};
     const companyName = companyInfo.CompanyName || "Unknown company";
 
-    // 3) INVOICE -> MINI REPORT NEXUS (vendite per stato)
+    // 3) INVOICE + SALES RECEIPT -> MINI REPORT NEXUS (vendite per stato)
     const queryUrl = `https://sandbox-quickbooks.api.intuit.com/v3/company/${realmId}/query?minorversion=65`;
 
-    // Per ora: ultime 52 settimane (~365 giorni)
-    const today = new Date();
-    const oneYearAgo = new Date(today);
-    oneYearAgo.setDate(today.getDate() - 365);
+    const whereClause = `TxnDate >= '${fromDate}' AND TxnDate <= '${toDate}'`;
 
-    const yyyy = oneYearAgo.getFullYear();
-    const mm = String(oneYearAgo.getMonth() + 1).padStart(2, "0");
-    const dd = String(oneYearAgo.getDate()).padStart(2, "0");
-    const fromDate = `${yyyy}-${mm}-${dd}`;
+    const invoiceQuery = `select * from Invoice where ${whereClause}`;
+    const receiptQuery = `select * from SalesReceipt where ${whereClause}`;
 
-    const qboQuery = `select * from Invoice where TxnDate >= '${fromDate}'`;
+    async function runQuery(q) {
+      const resp = await fetch(queryUrl, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: "application/json",
+          "Content-Type": "application/text"
+        },
+        body: q
+      });
+      return resp.json();
+    }
 
-    const invoicesResp = await fetch(queryUrl, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        Accept: "application/json",
-        "Content-Type": "application/text"
-      },
-      body: qboQuery
-    });
-
-    const invoicesData = await invoicesResp.json();
+    const [invoicesData, receiptsData] = await Promise.all([
+      runQuery(invoiceQuery),
+      runQuery(receiptQuery)
+    ]);
 
     const invoices =
       (invoicesData.QueryResponse &&
         invoicesData.QueryResponse.Invoice) ||
       [];
+    const receipts =
+      (receiptsData.QueryResponse &&
+        receiptsData.QueryResponse.SalesReceipt) ||
+      [];
 
-    // 4) RAGGRUPPO PER STATO (ShipAddr.CountrySubDivisionCode)
     const totalsByState = {};
 
-    for (const inv of invoices) {
-      const shipAddr = inv.ShipAddr || {};
-      const stateCode = shipAddr.CountrySubDivisionCode || "N/A";
-      const amount = Number(inv.TotalAmt) || 0;
+    function accumulate(docs) {
+      for (const doc of docs) {
+        const shipAddr = doc.ShipAddr || {};
+        const stateCode = shipAddr.CountrySubDivisionCode || "N/A";
+        const amount = Number(doc.TotalAmt) || 0;
 
-      if (!totalsByState[stateCode]) {
-        totalsByState[stateCode] = {
-          state: stateCode,
-          orders: 0,
-          sales: 0
-        };
+        if (!totalsByState[stateCode]) {
+          totalsByState[stateCode] = {
+            state: stateCode,
+            orders: 0,
+            sales: 0
+          };
+        }
+
+        totalsByState[stateCode].orders += 1;
+        totalsByState[stateCode].sales += amount;
       }
-
-      totalsByState[stateCode].orders += 1;
-      totalsByState[stateCode].sales += amount;
     }
+
+    accumulate(invoices);
+    accumulate(receipts);
 
     const rows = Object.values(totalsByState).sort((a, b) => b.sales - a.sales);
 
@@ -156,7 +215,7 @@ export default async function handler(req, res) {
     const totalSales = rows.reduce((sum, r) => sum + r.sales, 0);
     const totalOrders = rows.reduce((sum, r) => sum + r.orders, 0);
 
-    // 5) HTML PULITO
+    // 5) HTML
     res.status(200).setHeader("Content-Type", "text/html; charset=utf-8");
 
     const html = `<!DOCTYPE html>
@@ -294,9 +353,10 @@ export default async function handler(req, res) {
   </div>
 
   <div class="card">
-    <h2>Sales Nexus Snapshot (Invoice, from ${fromDate})</h2>
+    <h2>Sales Nexus Snapshot</h2>
     <p class="meta">
-      Thresholds used: <strong>${formatMoney(
+      Period: <strong>${rangeLabel}</strong> (${fromDate} → ${toDate})<br/>
+      Thresholds: <strong>${formatMoney(
         SALES_THRESHOLD
       )}</strong> sales OR <strong>${ORDERS_THRESHOLD}</strong> orders per state.
     </p>
@@ -326,7 +386,7 @@ export default async function handler(req, res) {
 
     ${
       rows.length === 0
-        ? "<p style=\"margin-top:1rem;\">No invoices found in the selected period.</p>"
+        ? "<p style=\"margin-top:1rem;\">No sales documents found (Invoice / SalesReceipt) in the selected period.</p>"
         : `
     <table>
       <thead>
