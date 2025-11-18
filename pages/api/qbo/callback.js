@@ -74,13 +74,11 @@ function aggregateSalesByState(invoices, receipts) {
   (invoices || []).forEach(addTxn);
   (receipts || []).forEach(addTxn);
 
-  // trasformiamo in array e calcoliamo average order
   const rows = Array.from(byState.values()).map((row) => ({
     ...row,
     avgOrder: row.orders ? row.sales / row.orders : 0,
   }));
 
-  // ordiniamo per sales desc
   rows.sort((a, b) => b.sales - a.sales);
 
   return rows;
@@ -123,11 +121,8 @@ function applyNexusRulesToRows(rows) {
         risk = "Likely nexus";
         severity = "high";
       } else {
-        // guardiamo quanto "vicino" è
         const salesRatio =
-          rule.thresholdSales != null
-            ? row.sales / rule.thresholdSales
-            : 0;
+          rule.thresholdSales != null ? row.sales / rule.thresholdSales : 0;
         const ordersRatio =
           rule.thresholdTransactions != null
             ? row.orders / rule.thresholdTransactions
@@ -210,7 +205,14 @@ function buildDateRange(preset) {
 
 export default async function handler(req, res) {
   try {
-    const { code, state, realmId, error } = req.query;
+    const {
+      code,
+      state,
+      realmId,
+      error,
+      accessToken: accessTokenFromQuery,
+      refreshToken: refreshTokenFromQuery,
+    } = req.query;
 
     if (error) {
       return res
@@ -218,43 +220,60 @@ export default async function handler(req, res) {
         .send(`Intuit returned an error: ${error}. Please try again.`);
     }
 
-    if (!code || !realmId) {
-      return res
-        .status(400)
-        .send("Missing code or realmId in callback query parameters.");
+    if (!realmId) {
+      return res.status(400).send("Missing realmId in callback.");
     }
 
-    // 1) Exchange auth code per access token + refresh token
-    const tokenResp = await fetch(
-      "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
-      {
-        method: "POST",
-        headers: {
-          Authorization: basicAuthHeader(),
-          "Content-Type": "application/x-www-form-urlencoded",
-          Accept: "application/json",
+    let accessToken = accessTokenFromQuery || null;
+    let refreshToken = refreshTokenFromQuery || null;
+    let expiresIn = null;
+    let xRefreshExpiresIn = null;
+
+    // SE abbiamo già l'access token nella query (change di periodo),
+    // saltiamo lo scambio del "code" con Intuit.
+    if (!accessToken) {
+      if (!code) {
+        return res
+          .status(400)
+          .send("Missing authorization code or access token.");
+      }
+
+      const tokenResp = await fetch(
+        "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
+        {
+          method: "POST",
+          headers: {
+            Authorization: basicAuthHeader(),
+            "Content-Type": "application/x-www-form-urlencoded",
+            Accept: "application/json",
+          },
+          body: new URLSearchParams({
+            grant_type: "authorization_code",
+            code,
+            redirect_uri: REDIRECT_URI,
+          }).toString(),
         },
-        body: new URLSearchParams({
-          grant_type: "authorization_code",
-          code,
-          redirect_uri: REDIRECT_URI,
-        }).toString(),
-      },
-    );
+      );
 
-    if (!tokenResp.ok) {
-      const text = await tokenResp.text();
-      console.error("[QBO] Token exchange failed:", tokenResp.status, text);
-      return res
-        .status(500)
-        .send("Failed to obtain tokens from Intuit. Check server logs.");
+      if (!tokenResp.ok) {
+        const text = await tokenResp.text();
+        console.error("[QBO] Token exchange failed:", tokenResp.status, text);
+        return res
+          .status(500)
+          .send("Failed to obtain tokens from Intuit. Check server logs.");
+      }
+
+      const tokenJson = await tokenResp.json();
+      accessToken = tokenJson.access_token;
+      refreshToken = tokenJson.refresh_token;
+      expiresIn = tokenJson.expires_in;
+      xRefreshExpiresIn = tokenJson.x_refresh_token_expires_in;
+    } else {
+      // accessToken passato via query (seconda chiamata)
+      // mettiamo valori "di default" solo per visualizzare qualcosa in UI
+      expiresIn = 3600;
+      xRefreshExpiresIn = 60 * 60 * 24 * 30;
     }
-
-    const tokenJson = await tokenResp.json();
-    const accessToken = tokenJson.access_token;
-    const refreshToken = tokenJson.refresh_token;
-    const expiresIn = tokenJson.expires_in;
-    const xRefreshExpiresIn = tokenJson.x_refresh_token_expires_in;
 
     // 2) Company info
     const companyInfoResp = await fetch(
@@ -283,7 +302,7 @@ export default async function handler(req, res) {
       companyInfo.LegalName ||
       "Unknown QuickBooks company";
 
-    // 3) Date range in base al preset
+    // 3) Date range
     const rangePreset = req.query.range || "last12";
     const { start, end, label: periodLabel, preset } =
       buildDateRange(rangePreset);
@@ -291,7 +310,6 @@ export default async function handler(req, res) {
     const startStr = isoDate(start);
     const endStr = isoDate(end);
 
-    // Helper per query QBO
     const runQboQuery = async (entityName) => {
       const query = encodeURIComponent(
         `select * from ${entityName} where TxnDate >= '${startStr}' and TxnDate <= '${endStr}'`,
@@ -343,7 +361,6 @@ export default async function handler(req, res) {
       statesOverSalesThreshold,
     } = applyNexusRulesToRows(aggregatedRows);
 
-    // 7) HTML response (già pronto da mostrare in browser)
     const tokenValidMinutes = Math.round((expiresIn || 3600) / 60);
     const refreshValidDays = Math.round((xRefreshExpiresIn || 0) / 86400);
 
@@ -622,7 +639,10 @@ export default async function handler(req, res) {
           </select>
           <input type="hidden" name="realmId" value="${realmId}" />
           <input type="hidden" name="state" value="${state || ""}" />
-          <input type="hidden" name="code" value="${code}" />
+          <input type="hidden" name="accessToken" value="${accessToken}" />
+          <input type="hidden" name="refreshToken" value="${
+            refreshToken || ""
+          }" />
         </form>
         <div class="text-muted">
           Each row is based on Invoices + Sales Receipts in the selected period.
