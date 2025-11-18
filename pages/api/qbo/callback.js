@@ -48,14 +48,10 @@ function formatMoney(amount) {
   });
 }
 
-/**
- * True if txn.TxnDate is between start and end (inclusive).
- */
-function isTxnInRange(txn, start, end) {
-  if (!txn || !txn.TxnDate) return false;
-  const d = new Date(txn.TxnDate);
-  if (Number.isNaN(d.getTime())) return false;
-  return d >= start && d <= end;
+// Safely extract state from an address object
+function extractState(addr) {
+  if (!addr || typeof addr !== "object") return null;
+  return addr.CountrySubDivisionCode || addr.State || null;
 }
 
 /**
@@ -65,29 +61,27 @@ function isTxnInRange(txn, start, end) {
  * basis:
  *  - "accrual": tutte le Invoice + tutte le SalesReceipt nel periodo
  *  - "cash":    solo Invoice con Balance == 0 (pagate) + tutte le SalesReceipt
+ *
+ * Restituisce:
+ *  - rows:     aggregazione per stato
+ *  - csvTxns:  array di tutte le transazioni effettivamente usate nel report
+ *              (per CSV di riconciliazione)
  */
 function aggregateSalesByState(invoices, receipts, basis) {
   const byState = new Map();
+  const csvTxns = [];
 
-  const addTxn = (txn) => {
+  const addTxn = (txn, sourceType) => {
     if (!txn) return;
 
     const amount = Number(txn.TotalAmt || 0);
     if (!amount) return;
 
-    const addr = txn.ShipAddr || txn.BillAddr || {};
+    const ship = txn.ShipAddr || null;
+    const bill = txn.BillAddr || null;
 
-    // Primary: proper QBO state field
-    let state = addr.CountrySubDivisionCode || "";
-
-    // Fallback: generic "State" field sometimes used by imports
-    if (!state && typeof addr.State === "string") {
-      state = addr.State;
-    }
-
-    if (!state) {
-      state = "N/A";
-    }
+    // Nuova logica: ShipAddr se ha lo stato, altrimenti fallback su BillAddr
+    let state = extractState(ship) || extractState(bill) || "N/A";
 
     if (!byState.has(state)) {
       byState.set(state, { state, orders: 0, sales: 0 });
@@ -95,6 +89,16 @@ function aggregateSalesByState(invoices, receipts, basis) {
     const entry = byState.get(state);
     entry.orders += 1;
     entry.sales += amount;
+
+    csvTxns.push({
+      type: sourceType,
+      docNumber: txn.DocNumber || "",
+      txnDate: txn.TxnDate || "",
+      customer: txn.CustomerRef?.name || "",
+      state,
+      totalAmt: amount,
+      balance: Number(txn.Balance || 0),
+    });
   };
 
   const safeInvoices = Array.isArray(invoices) ? invoices : [];
@@ -107,16 +111,16 @@ function aggregateSalesByState(invoices, receipts, basis) {
     safeInvoices.forEach((txn) => {
       const bal = Number(txn.Balance || 0);
       if (bal === 0) {
-        addTxn(txn);
+        addTxn(txn, "Invoice");
       }
     });
-    safeReceipts.forEach(addTxn);
+    safeReceipts.forEach((txn) => addTxn(txn, "SalesReceipt"));
   } else {
     // ACCRUAL BASIS (default):
     // - tutte le Invoice
     // - tutte le SalesReceipt
-    safeInvoices.forEach(addTxn);
-    safeReceipts.forEach(addTxn);
+    safeInvoices.forEach((txn) => addTxn(txn, "Invoice"));
+    safeReceipts.forEach((txn) => addTxn(txn, "SalesReceipt"));
   }
 
   const rows = Array.from(byState.values()).map((row) => ({
@@ -126,7 +130,7 @@ function aggregateSalesByState(invoices, receipts, basis) {
 
   rows.sort((a, b) => b.sales - a.sales);
 
-  return rows;
+  return { rows, csvTxns };
 }
 
 /**
@@ -248,6 +252,13 @@ function buildDateRange(preset) {
   return { start, end, label, preset: preset || "last12" };
 }
 
+// CSV escaping
+function csvEscape(value) {
+  if (value === null || value === undefined) return '""';
+  const s = String(value).replace(/"/g, '""');
+  return `"${s}"`;
+}
+
 export default async function handler(req, res) {
   try {
     const {
@@ -325,7 +336,6 @@ export default async function handler(req, res) {
       xRefreshExpiresIn = tokenJson.x_refresh_token_expires_in;
     } else {
       // accessToken passato via query (seconda chiamata)
-      // mettiamo valori "di default" solo per visualizzare qualcosa in UI
       expiresIn = 3600;
       xRefreshExpiresIn = 60 * 60 * 24 * 30;
     }
@@ -367,16 +377,15 @@ export default async function handler(req, res) {
 
     /**
      * Query helper con paginazione.
-     * Qui NON applichiamo alcun filtro data lato QBO.
-     * Prendiamo tutte le transazioni e filtriamo per TxnDate in JS.
+     * QBO limita a 1000 risultati per query; qui cicliamo tutte le pagine.
      */
-    const runQboQueryAll = async (entityName) => {
+    const runQboQuery = async (entityName) => {
       const pageSize = 1000;
       let startPosition = 1;
       let all = [];
 
       while (true) {
-        const q = `select * from ${entityName} startposition ${startPosition} maxresults ${pageSize}`;
+        const q = `select * from ${entityName} where TxnDate >= '${startStr}' and TxnDate <= '${endStr}' startposition ${startPosition} maxresults ${pageSize}`;
         const query = encodeURIComponent(q);
         const url = `${QBO_BASE_URL}/${realmId}/query?minorversion=70&query=${query}`;
 
@@ -411,22 +420,14 @@ export default async function handler(req, res) {
       return all;
     };
 
-    // 4) Invoice + SalesReceipt (tutte le pagine, nessun filtro data lato QBO)
-    const [allInvoices, allSalesReceipts] = await Promise.all([
-      runQboQueryAll("Invoice"),
-      runQboQueryAll("SalesReceipt"),
+    // 4) Invoice + SalesReceipt nel periodo (tutte le pagine)
+    const [invoices, salesReceipts] = await Promise.all([
+      runQboQuery("Invoice"),
+      runQboQuery("SalesReceipt"),
     ]);
 
-    // 5) Filtriamo lato JS per TxnDate nel range scelto
-    const invoices = (allInvoices || []).filter((txn) =>
-      isTxnInRange(txn, start, end),
-    );
-    const salesReceipts = (allSalesReceipts || []).filter((txn) =>
-      isTxnInRange(txn, start, end),
-    );
-
-    // 6) Aggregazione per stato (basis: accrual / cash)
-    const aggregatedRows = aggregateSalesByState(
+    // 5) Aggregazione per stato (basis: accrual / cash) + elenco transazioni per CSV
+    const { rows: aggregatedRows, csvTxns } = aggregateSalesByState(
       invoices,
       salesReceipts,
       basis,
@@ -441,7 +442,7 @@ export default async function handler(req, res) {
       0,
     );
 
-    // 7) Applicare regole economic nexus
+    // 6) Applicare regole economic nexus
     const {
       rows: rowsWithRisk,
       statesOverAnyThreshold,
@@ -462,41 +463,54 @@ export default async function handler(req, res) {
       { value: "cash", label: "Cash basis" },
     ];
 
-    // 8) Debug: campione UT / N/A e conteggi
+    // Costruzione CSV per download (solo transazioni realmente usate nel report)
+    const csvHeader = [
+      "Type",
+      "DocNumber",
+      "TxnDate",
+      "Customer",
+      "State",
+      "TotalAmt",
+      "Balance",
+    ].map(csvEscape);
+    const csvLines = csvTxns.map((t) =>
+      [
+        t.type,
+        t.docNumber,
+        t.txnDate,
+        t.customer,
+        t.state,
+        t.totalAmt,
+        t.balance,
+      ].map(csvEscape),
+    );
+    const csvString = [csvHeader, ...csvLines]
+      .map((row) => row.join(","))
+      .join("\n");
+    const csvBase64 = Buffer.from(csvString, "utf8").toString("base64");
+
+    // Debug sample costruito *dopo* aver applicato la stessa logica del report
     const debugSample = {
       basis,
       dateRange: { start: startStr, end: endStr },
-      invoiceCountAll: allInvoices?.length || 0,
-      salesReceiptCountAll: allSalesReceipts?.length || 0,
-      invoiceCountInRange: invoices.length,
-      salesReceiptCountInRange: salesReceipts.length,
+      invoiceCountAll: invoices?.length || 0,
+      salesReceiptCountAll: salesReceipts?.length || 0,
+      invoiceCountInRange: csvTxns.filter((t) => t.type === "Invoice").length,
+      salesReceiptCountInRange: csvTxns.filter(
+        (t) => t.type === "SalesReceipt",
+      ).length,
       sampleUT: [],
       sampleNA: [],
     };
 
-    (invoices || []).forEach((txn) => {
-      const addr = txn.ShipAddr || txn.BillAddr || {};
-      const st =
-        addr.CountrySubDivisionCode ||
-        (typeof addr.State === "string" ? addr.State : "") ||
-        "N/A";
-
-      const info = {
-        DocNumber: txn.DocNumber,
-        TxnDate: txn.TxnDate,
-        TotalAmt: txn.TotalAmt,
-        Balance: txn.Balance,
-        State: st,
-        Customer: txn.CustomerRef?.name || null,
-      };
-
-      if (st === "UT" && debugSample.sampleUT.length < 20) {
-        debugSample.sampleUT.push(info);
+    for (const t of csvTxns) {
+      if (t.state === "UT" && debugSample.sampleUT.length < 100) {
+        debugSample.sampleUT.push(t);
       }
-      if (st === "N/A" && debugSample.sampleNA.length < 20) {
-        debugSample.sampleNA.push(info);
+      if (t.state === "N/A" && debugSample.sampleNA.length < 100) {
+        debugSample.sampleNA.push(t);
       }
-    });
+    }
 
     const html = /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -507,35 +521,26 @@ export default async function handler(req, res) {
   <style>
     :root {
       color-scheme: light dark;
-      --bg: #f5f5f7;
-      --card-bg: #ffffff;
-      --text-main: #111111;
-      --text-muted: #555555;
-      --border-subtle: #e0e0e0;
+      --bg: #0b1120;
+      --card-bg: #020617;
+      --text-main: #e5e7eb;
+      --text-muted: #9ca3af;
+      --border-subtle: #1f2937;
       --accent: #2563eb;
-      --accent-soft: #dbeafe;
-      --danger: #b91c1c;
-      --danger-soft: #fee2e2;
-      --warn: #92400e;
-      --warn-soft: #fef3c7;
-      --ok-soft: #dcfce7;
-      --ok: #166534;
-    }
-    @media (prefers-color-scheme: dark) {
-      :root {
-        --bg: #020617;
-        --card-bg: #0f172a;
-        --text-main: #e5e7eb;
-        --text-muted: #9ca3af;
-        --border-subtle: #1f2937;
-      }
+      --accent-soft: #1d4ed8;
+      --danger: #f97373;
+      --danger-soft: #7f1d1d;
+      --warn: #facc15;
+      --warn-soft: #78350f;
+      --ok-soft: #14532d;
+      --ok: #22c55e;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
         sans-serif;
-      background: var(--bg);
+      background: radial-gradient(circle at top, #1e293b, #020617 55%);
       color: var(--text-main);
       padding: 24px;
     }
@@ -564,12 +569,12 @@ export default async function handler(req, res) {
       margin-left: 8px;
     }
     .card {
-      background: var(--card-bg);
+      background: radial-gradient(circle at top left, #111827, #020617 70%);
       border-radius: 16px;
       padding: 18px 20px;
       margin-bottom: 18px;
-      box-shadow: 0 12px 24px rgba(15,23,42,0.08);
-      border: 1px solid rgba(148,163,184,0.25);
+      box-shadow: 0 18px 40px rgba(15,23,42,0.9);
+      border: 1px solid rgba(148,163,184,0.35);
     }
     .card-title {
       font-size: 16px;
@@ -601,7 +606,7 @@ export default async function handler(req, res) {
       padding: 12px 14px;
       border-radius: 12px;
       border: 1px solid var(--border-subtle);
-      background: rgba(15,23,42,0.02);
+      background: linear-gradient(135deg, #020617, #0f172a);
     }
     .stat-label {
       font-size: 11px;
@@ -636,7 +641,7 @@ export default async function handler(req, res) {
       padding: 4px 8px;
       border-radius: 8px;
       border: 1px solid var(--border-subtle);
-      background: var(--card-bg);
+      background: #020617;
       color: var(--text-main);
     }
 
@@ -646,7 +651,7 @@ export default async function handler(req, res) {
       font-size: 13px;
     }
     thead {
-      background: rgba(15,23,42,0.03);
+      background: rgba(15,23,42,0.8);
     }
     th, td {
       padding: 8px 10px;
@@ -661,7 +666,7 @@ export default async function handler(req, res) {
       padding-right: 4px;
     }
     tbody tr:hover {
-      background: rgba(37,99,235,0.05);
+      background: rgba(37,99,235,0.18);
     }
     .text-right { text-align: right; }
     .text-muted { color: var(--text-muted); font-size: 12px; }
@@ -676,23 +681,23 @@ export default async function handler(req, res) {
       border: 1px solid transparent;
     }
     .badge-high {
-      background: var(--danger-soft);
-      color: var(--danger);
-      border-color: rgba(239,68,68,0.5);
+      background: rgba(248,113,113,0.18);
+      color: #fecaca;
+      border-color: rgba(248,113,113,0.6);
     }
     .badge-medium {
-      background: var(--warn-soft);
-      color: var(--warn);
-      border-color: rgba(234,179,8,0.6);
+      background: rgba(250,204,21,0.16);
+      color: #fde68a;
+      border-color: rgba(250,204,21,0.6);
     }
     .badge-low {
-      background: var(--ok-soft);
-      color: var(--ok);
-      border-color: rgba(34,197,94,0.5);
+      background: rgba(52,211,153,0.18);
+      color: #bbf7d0;
+      border-color: rgba(52,211,153,0.6);
     }
     .badge-none,
     .badge-info {
-      background: rgba(148,163,184,0.12);
+      background: rgba(148,163,184,0.16);
       color: var(--text-muted);
       border-color: rgba(148,163,184,0.5);
     }
@@ -704,6 +709,19 @@ export default async function handler(req, res) {
     }
     summary {
       cursor: pointer;
+    }
+
+    .csv-link {
+      font-size: 13px;
+      text-decoration: none;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(148,163,184,0.6);
+      color: #e5e7eb;
+      background: rgba(15,23,42,0.6);
+    }
+    .csv-link:hover {
+      border-color: #60a5fa;
     }
   </style>
 </head>
@@ -786,10 +804,18 @@ export default async function handler(req, res) {
             refreshToken || ""
           }" />
         </form>
-        <div class="text-muted">
-          Each row is based on Invoices + Sales Receipts in the selected period,
-          filtered according to the chosen accounting basis.
-        </div>
+
+        <a
+          class="csv-link"
+          href="data:text/csv;base64,${csvBase64}"
+          download="nexus_txns_${startStr}_${endStr}_${basis}.csv"
+        >
+          Download CSV (transactions used in this report)
+        </a>
+      </div>
+
+      <div class="text-muted" style="margin-bottom:10px;">
+        Each row below is based on the same Invoices + Sales Receipts that feed the CSV file.
       </div>
 
       <div style="overflow-x:auto;">
@@ -837,9 +863,7 @@ export default async function handler(req, res) {
                           <td>${row.state}</td>
                           <td class="text-right">${row.orders}</td>
                           <td class="text-right">${formatMoney(row.sales)}</td>
-                          <td class="text-right">${formatMoney(
-                            row.avgOrder,
-                          )}</td>
+                          <td class="text-right">${formatMoney(row.avgOrder)}</td>
                           <td>
                             <span class="badge ${badgeClass}" title="${noteText.replace(
                               /"/g,
@@ -858,7 +882,7 @@ export default async function handler(req, res) {
       </div>
 
       <details>
-        <summary>Debug info (counts + UT/N/A samples)</summary>
+        <summary>Debug info (UT / N/A samples)</summary>
         <pre>${JSON.stringify(debugSample, null, 2)}</pre>
       </details>
     </section>
