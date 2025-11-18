@@ -65,8 +65,20 @@ function aggregateSalesByState(invoices, receipts, basis) {
     const amount = Number(txn.TotalAmt || 0);
     if (!amount) return;
 
-    const addr = txn.ShipAddr || txn.BillAddr || {};
-    const state = addr.CountrySubDivisionCode || "N/A";
+const addr = txn.ShipAddr || txn.BillAddr || {};
+
+// Primary: proper QBO state field
+let state = addr.CountrySubDivisionCode || "";
+
+// Fallback: try to guess from "CountrySubDivisionCode" typo or generic "State" field
+if (!state && typeof addr.State === "string") {
+  state = addr.State;
+}
+
+// Final fallback
+if (!state) {
+  state = "N/A";
+}
 
     if (!byState.has(state)) {
       byState.set(state, { state, orders: 0, sales: 0 });
@@ -431,6 +443,39 @@ export default async function handler(req, res) {
       { value: "accrual", label: "Accrual basis" },
       { value: "cash", label: "Cash basis" },
     ];
+// Build a debug sample for UT and N/A to help reconciliation
+const debugSample = {
+  basis,
+  dateRange: { start: startStr, end: endStr },
+  invoiceCount: invoices?.length || 0,
+  salesReceiptCount: salesReceipts?.length || 0,
+  sampleUT: [],
+  sampleNA: [],
+};
+
+(invoices || []).forEach((txn) => {
+  const addr = txn.ShipAddr || txn.BillAddr || {};
+  const st =
+    addr.CountrySubDivisionCode ||
+    (typeof addr.State === "string" ? addr.State : "N/A") ||
+    "N/A";
+
+  const info = {
+    DocNumber: txn.DocNumber,
+    TxnDate: txn.TxnDate,
+    TotalAmt: txn.TotalAmt,
+    Balance: txn.Balance,
+    State: st,
+    Customer: txn.CustomerRef?.name || null,
+  };
+
+  if (st === "UT" && debugSample.sampleUT.length < 20) {
+    debugSample.sampleUT.push(info);
+  }
+  if (st === "N/A" && debugSample.sampleNA.length < 20) {
+    debugSample.sampleNA.push(info);
+  }
+});
 
     const html = /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -791,10 +836,10 @@ export default async function handler(req, res) {
         </table>
       </div>
 
-      <details>
-        <summary>Debug info (raw company info JSON)</summary>
-        <pre>${JSON.stringify(companyInfo, null, 2)}</pre>
-      </details>
+<details>
+  <summary>Debug info (counts + UT/N/A samples)</summary>
+  <pre>${JSON.stringify(debugSample, null, 2)}</pre>
+</details>
 
       <details>
         <summary>Debug info (counts)</summary>
