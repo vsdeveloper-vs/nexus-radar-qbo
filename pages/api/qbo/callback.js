@@ -51,12 +51,17 @@ function formatMoney(amount) {
 /**
  * Aggrega vendite (Invoice + SalesReceipt) per stato.
  * Ogni documento conta come 1 "ordine".
+ *
+ * basis:
+ *  - "accrual": tutte le Invoice + tutte le SalesReceipt nel periodo
+ *  - "cash":    solo Invoice con Balance == 0 (pagate) + tutte le SalesReceipt
  */
-function aggregateSalesByState(invoices, receipts) {
+function aggregateSalesByState(invoices, receipts, basis) {
   const byState = new Map();
 
   const addTxn = (txn) => {
     if (!txn) return;
+
     const amount = Number(txn.TotalAmt || 0);
     if (!amount) return;
 
@@ -71,8 +76,27 @@ function aggregateSalesByState(invoices, receipts) {
     entry.sales += amount;
   };
 
-  (invoices || []).forEach(addTxn);
-  (receipts || []).forEach(addTxn);
+  const safeInvoices = Array.isArray(invoices) ? invoices : [];
+  const safeReceipts = Array.isArray(receipts) ? receipts : [];
+
+  if (basis === "cash") {
+    // CASH BASIS:
+    // - Invoice: solo quelle completamente pagate (Balance == 0)
+    // - SalesReceipt: sempre incluse (sono già cash)
+    safeInvoices.forEach((txn) => {
+      const bal = Number(txn.Balance || 0);
+      if (bal === 0) {
+        addTxn(txn);
+      }
+    });
+    safeReceipts.forEach(addTxn);
+  } else {
+    // ACCRUAL BASIS (default):
+    // - tutte le Invoice
+    // - tutte le SalesReceipt
+    safeInvoices.forEach(addTxn);
+    safeReceipts.forEach(addTxn);
+  }
 
   const rows = Array.from(byState.values()).map((row) => ({
     ...row,
@@ -224,12 +248,22 @@ export default async function handler(req, res) {
       return res.status(400).send("Missing realmId in callback.");
     }
 
+    // basis: "accrual" (default) oppure "cash"
+    const basis =
+      req.query.basis && req.query.basis.toLowerCase() === "cash"
+        ? "cash"
+        : "accrual";
+    const basisLabel =
+      basis === "cash"
+        ? "Cash basis (paid Invoices + all Sales Receipts)"
+        : "Accrual basis (all Invoices + all Sales Receipts)";
+
     let accessToken = accessTokenFromQuery || null;
     let refreshToken = refreshTokenFromQuery || null;
     let expiresIn = null;
     let xRefreshExpiresIn = null;
 
-    // SE abbiamo già l'access token nella query (change di periodo),
+    // Se abbiamo già l'access token nella query (change di periodo / basis),
     // saltiamo lo scambio del "code" con Intuit.
     if (!accessToken) {
       if (!code) {
@@ -310,40 +344,63 @@ export default async function handler(req, res) {
     const startStr = isoDate(start);
     const endStr = isoDate(end);
 
+    /**
+     * Query helper con paginazione.
+     * QBO limita a 1000 risultati per query; qui cicliamo tutte le pagine.
+     */
     const runQboQuery = async (entityName) => {
-      const query = encodeURIComponent(
-        `select * from ${entityName} where TxnDate >= '${startStr}' and TxnDate <= '${endStr}'`,
-      );
-      const url = `${QBO_BASE_URL}/${realmId}/query?minorversion=70&query=${query}`;
-      const resp = await fetch(url, {
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: "application/json",
-        },
-      });
+      const pageSize = 1000;
+      let startPosition = 1;
+      let all = [];
 
-      if (!resp.ok) {
-        const text = await resp.text();
-        console.error(
-          `[QBO] Query error for ${entityName}:`,
-          resp.status,
-          text,
-        );
-        return [];
+      while (true) {
+        const q = `select * from ${entityName} where TxnDate >= '${startStr}' and TxnDate <= '${endStr}' startposition ${startPosition} maxresults ${pageSize}`;
+        const query = encodeURIComponent(q);
+        const url = `${QBO_BASE_URL}/${realmId}/query?minorversion=70&query=${query}`;
+
+        const resp = await fetch(url, {
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            Accept: "application/json",
+          },
+        });
+
+        if (!resp.ok) {
+          const text = await resp.text();
+          console.error(
+            `[QBO] Query error for ${entityName}:`,
+            resp.status,
+            text,
+          );
+          break; // ritorna quello che abbiamo raccolto finora
+        }
+
+        const json = await resp.json();
+        const chunk = json?.QueryResponse?.[entityName] || [];
+        all = all.concat(chunk);
+
+        if (chunk.length < pageSize) {
+          break; // ultima pagina
+        }
+
+        startPosition += pageSize;
       }
 
-      const json = await resp.json();
-      return json?.QueryResponse?.[entityName] || [];
+      return all;
     };
 
-    // 4) Invoice + SalesReceipt nel periodo
+    // 4) Invoice + SalesReceipt nel periodo (tutte le pagine)
     const [invoices, salesReceipts] = await Promise.all([
       runQboQuery("Invoice"),
       runQboQuery("SalesReceipt"),
     ]);
 
-    // 5) Aggregazione per stato
-    const aggregatedRows = aggregateSalesByState(invoices, salesReceipts);
+    // 5) Aggregazione per stato (basis: accrual / cash)
+    const aggregatedRows = aggregateSalesByState(
+      invoices,
+      salesReceipts,
+      basis,
+    );
 
     const totalSalesPeriod = aggregatedRows.reduce(
       (sum, r) => sum + r.sales,
@@ -368,6 +425,11 @@ export default async function handler(req, res) {
       { value: "last12", label: "Last 12 months" },
       { value: "ytd", label: "Year to date" },
       { value: "lastCalendar", label: "Last calendar year" },
+    ];
+
+    const basisOptions = [
+      { value: "accrual", label: "Accrual basis" },
+      { value: "cash", label: "Cash basis" },
     ];
 
     const html = /* html */ `<!DOCTYPE html>
@@ -501,6 +563,7 @@ export default async function handler(req, res) {
       gap: 8px;
       font-size: 13px;
       color: var(--text-muted);
+      flex-wrap: wrap;
     }
     select {
       font-size: 13px;
@@ -600,6 +663,7 @@ export default async function handler(req, res) {
       <div class="card-title">Sales Nexus Snapshot</div>
       <div class="card-sub">
         Period: ${periodLabel}<br/>
+        Basis: <strong>${basisLabel}</strong><br/>
         Thresholds: per-state economic nexus rules based on
         <a href="https://www.salestaxinstitute.com/resources/economic-nexus-state-guide" target="_blank" rel="noreferrer">
           Sales Tax Institute’s Economic Nexus State Guide
@@ -637,6 +701,18 @@ export default async function handler(req, res) {
               )
               .join("")}
           </select>
+
+          <span style="font-size:13px; margin-left:8px;">Basis:</span>
+          <select name="basis" onchange="this.form.submit()">
+            ${basisOptions
+              .map(
+                (opt) => `<option value="${opt.value}"${
+                  opt.value === basis ? " selected" : ""
+                }>${opt.label}</option>`,
+              )
+              .join("")}
+          </select>
+
           <input type="hidden" name="realmId" value="${realmId}" />
           <input type="hidden" name="state" value="${state || ""}" />
           <input type="hidden" name="accessToken" value="${accessToken}" />
@@ -645,7 +721,8 @@ export default async function handler(req, res) {
           }" />
         </form>
         <div class="text-muted">
-          Each row is based on Invoices + Sales Receipts in the selected period.
+          Each row is based on Invoices + Sales Receipts in the selected period,
+          filtered according to the chosen accounting basis.
         </div>
       </div>
 
@@ -717,6 +794,20 @@ export default async function handler(req, res) {
       <details>
         <summary>Debug info (raw company info JSON)</summary>
         <pre>${JSON.stringify(companyInfo, null, 2)}</pre>
+      </details>
+
+      <details>
+        <summary>Debug info (counts)</summary>
+        <pre>${JSON.stringify(
+          {
+            basis,
+            invoiceCount: invoices?.length || 0,
+            salesReceiptCount: salesReceipts?.length || 0,
+            dateRange: { start: startStr, end: endStr },
+          },
+          null,
+          2,
+        )}</pre>
       </details>
     </section>
   </div>
