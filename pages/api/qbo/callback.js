@@ -49,6 +49,16 @@ function formatMoney(amount) {
 }
 
 /**
+ * True if txn.TxnDate is between start and end (inclusive).
+ */
+function isTxnInRange(txn, start, end) {
+  if (!txn || !txn.TxnDate) return false;
+  const d = new Date(txn.TxnDate);
+  if (Number.isNaN(d.getTime())) return false;
+  return d >= start && d <= end;
+}
+
+/**
  * Aggrega vendite (Invoice + SalesReceipt) per stato.
  * Ogni documento conta come 1 "ordine".
  *
@@ -65,20 +75,19 @@ function aggregateSalesByState(invoices, receipts, basis) {
     const amount = Number(txn.TotalAmt || 0);
     if (!amount) return;
 
-const addr = txn.ShipAddr || txn.BillAddr || {};
+    const addr = txn.ShipAddr || txn.BillAddr || {};
 
-// Primary: proper QBO state field
-let state = addr.CountrySubDivisionCode || "";
+    // Primary: proper QBO state field
+    let state = addr.CountrySubDivisionCode || "";
 
-// Fallback: try to guess from "CountrySubDivisionCode" typo or generic "State" field
-if (!state && typeof addr.State === "string") {
-  state = addr.State;
-}
+    // Fallback: generic "State" field sometimes used by imports
+    if (!state && typeof addr.State === "string") {
+      state = addr.State;
+    }
 
-// Final fallback
-if (!state) {
-  state = "N/A";
-}
+    if (!state) {
+      state = "N/A";
+    }
 
     if (!byState.has(state)) {
       byState.set(state, { state, orders: 0, sales: 0 });
@@ -358,15 +367,16 @@ export default async function handler(req, res) {
 
     /**
      * Query helper con paginazione.
-     * QBO limita a 1000 risultati per query; qui cicliamo tutte le pagine.
+     * Qui NON applichiamo alcun filtro data lato QBO.
+     * Prendiamo tutte le transazioni e filtriamo per TxnDate in JS.
      */
-    const runQboQuery = async (entityName) => {
+    const runQboQueryAll = async (entityName) => {
       const pageSize = 1000;
       let startPosition = 1;
       let all = [];
 
       while (true) {
-        const q = `select * from ${entityName} where TxnDate >= '${startStr}' and TxnDate <= '${endStr}' startposition ${startPosition} maxresults ${pageSize}`;
+        const q = `select * from ${entityName} startposition ${startPosition} maxresults ${pageSize}`;
         const query = encodeURIComponent(q);
         const url = `${QBO_BASE_URL}/${realmId}/query?minorversion=70&query=${query}`;
 
@@ -401,13 +411,21 @@ export default async function handler(req, res) {
       return all;
     };
 
-    // 4) Invoice + SalesReceipt nel periodo (tutte le pagine)
-    const [invoices, salesReceipts] = await Promise.all([
-      runQboQuery("Invoice"),
-      runQboQuery("SalesReceipt"),
+    // 4) Invoice + SalesReceipt (tutte le pagine, nessun filtro data lato QBO)
+    const [allInvoices, allSalesReceipts] = await Promise.all([
+      runQboQueryAll("Invoice"),
+      runQboQueryAll("SalesReceipt"),
     ]);
 
-    // 5) Aggregazione per stato (basis: accrual / cash)
+    // 5) Filtriamo lato JS per TxnDate nel range scelto
+    const invoices = (allInvoices || []).filter((txn) =>
+      isTxnInRange(txn, start, end),
+    );
+    const salesReceipts = (allSalesReceipts || []).filter((txn) =>
+      isTxnInRange(txn, start, end),
+    );
+
+    // 6) Aggregazione per stato (basis: accrual / cash)
     const aggregatedRows = aggregateSalesByState(
       invoices,
       salesReceipts,
@@ -423,7 +441,7 @@ export default async function handler(req, res) {
       0,
     );
 
-    // 6) Applicare regole economic nexus
+    // 7) Applicare regole economic nexus
     const {
       rows: rowsWithRisk,
       statesOverAnyThreshold,
@@ -443,39 +461,42 @@ export default async function handler(req, res) {
       { value: "accrual", label: "Accrual basis" },
       { value: "cash", label: "Cash basis" },
     ];
-// Build a debug sample for UT and N/A to help reconciliation
-const debugSample = {
-  basis,
-  dateRange: { start: startStr, end: endStr },
-  invoiceCount: invoices?.length || 0,
-  salesReceiptCount: salesReceipts?.length || 0,
-  sampleUT: [],
-  sampleNA: [],
-};
 
-(invoices || []).forEach((txn) => {
-  const addr = txn.ShipAddr || txn.BillAddr || {};
-  const st =
-    addr.CountrySubDivisionCode ||
-    (typeof addr.State === "string" ? addr.State : "N/A") ||
-    "N/A";
+    // 8) Debug: campione UT / N/A e conteggi
+    const debugSample = {
+      basis,
+      dateRange: { start: startStr, end: endStr },
+      invoiceCountAll: allInvoices?.length || 0,
+      salesReceiptCountAll: allSalesReceipts?.length || 0,
+      invoiceCountInRange: invoices.length,
+      salesReceiptCountInRange: salesReceipts.length,
+      sampleUT: [],
+      sampleNA: [],
+    };
 
-  const info = {
-    DocNumber: txn.DocNumber,
-    TxnDate: txn.TxnDate,
-    TotalAmt: txn.TotalAmt,
-    Balance: txn.Balance,
-    State: st,
-    Customer: txn.CustomerRef?.name || null,
-  };
+    (invoices || []).forEach((txn) => {
+      const addr = txn.ShipAddr || txn.BillAddr || {};
+      const st =
+        addr.CountrySubDivisionCode ||
+        (typeof addr.State === "string" ? addr.State : "") ||
+        "N/A";
 
-  if (st === "UT" && debugSample.sampleUT.length < 20) {
-    debugSample.sampleUT.push(info);
-  }
-  if (st === "N/A" && debugSample.sampleNA.length < 20) {
-    debugSample.sampleNA.push(info);
-  }
-});
+      const info = {
+        DocNumber: txn.DocNumber,
+        TxnDate: txn.TxnDate,
+        TotalAmt: txn.TotalAmt,
+        Balance: txn.Balance,
+        State: st,
+        Customer: txn.CustomerRef?.name || null,
+      };
+
+      if (st === "UT" && debugSample.sampleUT.length < 20) {
+        debugSample.sampleUT.push(info);
+      }
+      if (st === "N/A" && debugSample.sampleNA.length < 20) {
+        debugSample.sampleNA.push(info);
+      }
+    });
 
     const html = /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -836,23 +857,9 @@ const debugSample = {
         </table>
       </div>
 
-<details>
-  <summary>Debug info (counts + UT/N/A samples)</summary>
-  <pre>${JSON.stringify(debugSample, null, 2)}</pre>
-</details>
-
       <details>
-        <summary>Debug info (counts)</summary>
-        <pre>${JSON.stringify(
-          {
-            basis,
-            invoiceCount: invoices?.length || 0,
-            salesReceiptCount: salesReceipts?.length || 0,
-            dateRange: { start: startStr, end: endStr },
-          },
-          null,
-          2,
-        )}</pre>
+        <summary>Debug info (counts + UT/N/A samples)</summary>
+        <pre>${JSON.stringify(debugSample, null, 2)}</pre>
       </details>
     </section>
   </div>
