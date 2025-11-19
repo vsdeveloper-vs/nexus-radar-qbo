@@ -11,7 +11,6 @@ const CLIENT_SECRET =
 const REDIRECT_URI =
   process.env.QBO_REDIRECT_URI || process.env.INTUIT_REDIRECT_URI;
 
-// sandbox di default
 const QBO_ENV = process.env.QBO_ENV || "sandbox";
 const QBO_BASE_URL =
   QBO_ENV === "production"
@@ -65,7 +64,6 @@ function extractState(addr) {
  * Restituisce:
  *  - rows:     aggregazione per stato
  *  - csvTxns:  array di tutte le transazioni effettivamente usate nel report
- *              (per CSV di riconciliazione)
  */
 function aggregateSalesByState(invoices, receipts, basis) {
   const byState = new Map();
@@ -80,7 +78,7 @@ function aggregateSalesByState(invoices, receipts, basis) {
     const ship = txn.ShipAddr || null;
     const bill = txn.BillAddr || null;
 
-    // Nuova logica: ShipAddr se ha lo stato, altrimenti fallback su BillAddr
+    // ShipAddr se ha lo stato, altrimenti fallback su BillAddr
     let state = extractState(ship) || extractState(bill) || "N/A";
 
     if (!byState.has(state)) {
@@ -105,20 +103,14 @@ function aggregateSalesByState(invoices, receipts, basis) {
   const safeReceipts = Array.isArray(receipts) ? receipts : [];
 
   if (basis === "cash") {
-    // CASH BASIS:
-    // - Invoice: solo quelle completamente pagate (Balance == 0)
-    // - SalesReceipt: sempre incluse (sono già cash)
+    // CASH BASIS: solo Invoice con Balance == 0 + tutte le SalesReceipt
     safeInvoices.forEach((txn) => {
       const bal = Number(txn.Balance || 0);
-      if (bal === 0) {
-        addTxn(txn, "Invoice");
-      }
+      if (bal === 0) addTxn(txn, "Invoice");
     });
     safeReceipts.forEach((txn) => addTxn(txn, "SalesReceipt"));
   } else {
-    // ACCRUAL BASIS (default):
-    // - tutte le Invoice
-    // - tutte le SalesReceipt
+    // ACCRUAL BASIS: tutte
     safeInvoices.forEach((txn) => addTxn(txn, "Invoice"));
     safeReceipts.forEach((txn) => addTxn(txn, "SalesReceipt"));
   }
@@ -280,7 +272,6 @@ export default async function handler(req, res) {
       return res.status(400).send("Missing realmId in callback.");
     }
 
-    // basis: "accrual" (default) oppure "cash"
     const basis =
       req.query.basis && req.query.basis.toLowerCase() === "cash"
         ? "cash"
@@ -295,8 +286,6 @@ export default async function handler(req, res) {
     let expiresIn = null;
     let xRefreshExpiresIn = null;
 
-    // Se abbiamo già l'access token nella query (change di periodo / basis),
-    // saltiamo lo scambio del "code" con Intuit.
     if (!accessToken) {
       if (!code) {
         return res
@@ -335,12 +324,11 @@ export default async function handler(req, res) {
       expiresIn = tokenJson.expires_in;
       xRefreshExpiresIn = tokenJson.x_refresh_token_expires_in;
     } else {
-      // accessToken passato via query (seconda chiamata)
       expiresIn = 3600;
       xRefreshExpiresIn = 60 * 60 * 24 * 30;
     }
 
-    // 2) Company info
+    // Company info
     const companyInfoResp = await fetch(
       `${QBO_BASE_URL}/${realmId}/companyinfo/${realmId}?minorversion=70`,
       {
@@ -367,7 +355,7 @@ export default async function handler(req, res) {
       companyInfo.LegalName ||
       "Unknown QuickBooks company";
 
-    // 3) Date range
+    // Date range
     const rangePreset = req.query.range || "last12";
     const { start, end, label: periodLabel, preset } =
       buildDateRange(rangePreset);
@@ -375,10 +363,7 @@ export default async function handler(req, res) {
     const startStr = isoDate(start);
     const endStr = isoDate(end);
 
-    /**
-     * Query helper con paginazione.
-     * QBO limita a 1000 risultati per query; qui cicliamo tutte le pagine.
-     */
+    // QBO query helper with pagination
     const runQboQuery = async (entityName) => {
       const pageSize = 1000;
       let startPosition = 1;
@@ -403,30 +388,26 @@ export default async function handler(req, res) {
             resp.status,
             text,
           );
-          break; // ritorna quello che abbiamo raccolto finora
+          break;
         }
 
         const json = await resp.json();
         const chunk = json?.QueryResponse?.[entityName] || [];
         all = all.concat(chunk);
 
-        if (chunk.length < pageSize) {
-          break; // ultima pagina
-        }
-
+        if (chunk.length < pageSize) break;
         startPosition += pageSize;
       }
 
       return all;
     };
 
-    // 4) Invoice + SalesReceipt nel periodo (tutte le pagine)
     const [invoices, salesReceipts] = await Promise.all([
       runQboQuery("Invoice"),
       runQboQuery("SalesReceipt"),
     ]);
 
-    // 5) Aggregazione per stato (basis: accrual / cash) + elenco transazioni per CSV
+    // Aggregation + CSV txns
     const { rows: aggregatedRows, csvTxns } = aggregateSalesByState(
       invoices,
       salesReceipts,
@@ -442,7 +423,6 @@ export default async function handler(req, res) {
       0,
     );
 
-    // 6) Applicare regole economic nexus
     const {
       rows: rowsWithRisk,
       statesOverAnyThreshold,
@@ -463,7 +443,7 @@ export default async function handler(req, res) {
       { value: "cash", label: "Cash basis" },
     ];
 
-    // Costruzione CSV per download (solo transazioni realmente usate nel report)
+    // CSV build (only txns actually used)
     const csvHeader = [
       "Type",
       "DocNumber",
@@ -489,7 +469,7 @@ export default async function handler(req, res) {
       .join("\n");
     const csvBase64 = Buffer.from(csvString, "utf8").toString("base64");
 
-    // Debug sample costruito *dopo* aver applicato la stessa logica del report
+    // Debug sample
     const debugSample = {
       basis,
       dateRange: { start: startStr, end: endStr },
@@ -512,7 +492,66 @@ export default async function handler(req, res) {
       }
     }
 
-    const html = /* html */ `<!DOCTYPE html>
+    const rangeOptionsHtml = rangeOptions
+      .map(
+        (opt) =>
+          `<option value="${opt.value}"${
+            opt.value === preset ? " selected" : ""
+          }>${opt.label}</option>`,
+      )
+      .join("");
+
+    const basisOptionsHtml = basisOptions
+      .map(
+        (opt) =>
+          `<option value="${opt.value}"${
+            opt.value === basis ? " selected" : ""
+          }>${opt.label}</option>`,
+      )
+      .join("");
+
+    const rowsHtml =
+      rowsWithRisk.length === 0
+        ? `<tr><td colspan="5" class="text-muted" style="padding:14px;">No Invoice or Sales Receipt data found in this period.</td></tr>`
+        : rowsWithRisk
+            .map((row) => {
+              let badgeClass = "badge-none";
+              if (row.severity === "high") badgeClass = "badge-high";
+              else if (row.severity === "medium") badgeClass = "badge-medium";
+              else if (row.severity === "low") badgeClass = "badge-low";
+              else if (row.severity === "info") badgeClass = "badge-info";
+
+              const noteParts = [];
+              if (row.rule?.noStateSalesTax) {
+                noteParts.push("No state-level sales tax.");
+              }
+              if (row.thresholdLabel && !row.rule?.noStateSalesTax) {
+                noteParts.push("Threshold: " + row.thresholdLabel + ".");
+              }
+              if (row.rule?.notes) {
+                noteParts.push(row.rule.notes);
+              }
+              const noteText = noteParts.join(" ").replace(/"/g, "&quot;");
+
+              return `
+                <tr>
+                  <td>${row.state}</td>
+                  <td class="text-right">${row.orders}</td>
+                  <td class="text-right">${formatMoney(row.sales)}</td>
+                  <td class="text-right">${formatMoney(row.avgOrder)}</td>
+                  <td>
+                    <span class="badge ${badgeClass}" title="${noteText}">
+                      ${row.risk}
+                    </span>
+                  </td>
+                </tr>
+              `;
+            })
+            .join("");
+
+    const debugJson = JSON.stringify(debugSample, null, 2);
+
+    const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -527,13 +566,9 @@ export default async function handler(req, res) {
       --text-muted: #9ca3af;
       --border-subtle: #1f2937;
       --accent: #2563eb;
-      --accent-soft: #1d4ed8;
-      --danger: #f97373;
       --danger-soft: #7f1d1d;
-      --warn: #facc15;
       --warn-soft: #78350f;
       --ok-soft: #14532d;
-      --ok: #22c55e;
     }
     * { box-sizing: border-box; }
     body {
@@ -544,19 +579,9 @@ export default async function handler(req, res) {
       color: var(--text-main);
       padding: 24px;
     }
-    .page {
-      max-width: 1100px;
-      margin: 0 auto;
-    }
-    h1 {
-      font-size: 28px;
-      margin: 0 0 4px;
-    }
-    .subtitle {
-      font-size: 14px;
-      color: var(--text-muted);
-      margin-bottom: 20px;
-    }
+    .page { max-width: 1100px; margin: 0 auto; }
+    h1 { font-size: 28px; margin: 0 0 4px; }
+    .subtitle { font-size: 14px; color: var(--text-muted); margin-bottom: 20px; }
     .pill {
       display: inline-flex;
       align-items: center;
@@ -569,23 +594,15 @@ export default async function handler(req, res) {
       margin-left: 8px;
     }
     .card {
-      background: radial-gradient(circle at top left, #111827, #020617 70%);
+      background: #020617;
       border-radius: 16px;
       padding: 18px 20px;
       margin-bottom: 18px;
       box-shadow: 0 18px 40px rgba(15,23,42,0.9);
       border: 1px solid rgba(148,163,184,0.35);
     }
-    .card-title {
-      font-size: 16px;
-      font-weight: 600;
-      margin-bottom: 6px;
-    }
-    .card-sub {
-      font-size: 13px;
-      color: var(--text-muted);
-    }
-
+    .card-title { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
+    .card-sub { font-size: 13px; color: var(--text-muted); }
     .snapshot-grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -593,20 +610,16 @@ export default async function handler(req, res) {
       margin-bottom: 16px;
     }
     @media (max-width: 900px) {
-      .snapshot-grid {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }
+      .snapshot-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
     @media (max-width: 600px) {
-      .snapshot-grid {
-        grid-template-columns: 1fr;
-      }
+      .snapshot-grid { grid-template-columns: 1fr; }
     }
     .stat-card {
       padding: 12px 14px;
       border-radius: 12px;
       border: 1px solid var(--border-subtle);
-      background: linear-gradient(135deg, #020617, #0f172a);
+      background: #020617;
     }
     .stat-label {
       font-size: 11px;
@@ -615,11 +628,7 @@ export default async function handler(req, res) {
       color: var(--text-muted);
       margin-bottom: 4px;
     }
-    .stat-value {
-      font-size: 17px;
-      font-weight: 600;
-    }
-
+    .stat-value { font-size: 17px; font-weight: 600; }
     .filters-row {
       display: flex;
       justify-content: space-between;
@@ -644,33 +653,23 @@ export default async function handler(req, res) {
       background: #020617;
       color: var(--text-main);
     }
-
     table {
       width: 100%;
       border-collapse: collapse;
       font-size: 13px;
     }
-    thead {
-      background: rgba(15,23,42,0.8);
-    }
+    thead { background: rgba(15,23,42,0.8); }
     th, td {
       padding: 8px 10px;
       text-align: left;
       border-bottom: 1px solid var(--border-subtle);
       white-space: nowrap;
     }
-    th:first-child, td:first-child {
-      padding-left: 4px;
-    }
-    th:last-child, td:last-child {
-      padding-right: 4px;
-    }
-    tbody tr:hover {
-      background: rgba(37,99,235,0.18);
-    }
+    th:first-child, td:first-child { padding-left: 4px; }
+    th:last-child, td:last-child { padding-right: 4px; }
+    tbody tr:hover { background: rgba(37,99,235,0.18); }
     .text-right { text-align: right; }
     .text-muted { color: var(--text-muted); font-size: 12px; }
-
     .badge {
       display: inline-flex;
       align-items: center;
@@ -701,16 +700,8 @@ export default async function handler(req, res) {
       color: var(--text-muted);
       border-color: rgba(148,163,184,0.5);
     }
-
-    details {
-      margin-top: 8px;
-      font-size: 12px;
-      color: var(--text-muted);
-    }
-    summary {
-      cursor: pointer;
-    }
-
+    details { margin-top: 8px; font-size: 12px; color: var(--text-muted); }
+    summary { cursor: pointer; }
     .csv-link {
       font-size: 13px;
       text-decoration: none;
@@ -719,9 +710,6 @@ export default async function handler(req, res) {
       border: 1px solid rgba(148,163,184,0.6);
       color: #e5e7eb;
       background: rgba(15,23,42,0.6);
-    }
-    .csv-link:hover {
-      border-color: #60a5fa;
     }
   </style>
 </head>
@@ -777,24 +765,12 @@ export default async function handler(req, res) {
         <form method="GET">
           <span style="font-size:13px;">Period:</span>
           <select name="range" onchange="this.form.submit()">
-            ${rangeOptions
-              .map(
-                (opt) => `<option value="${opt.value}"${
-                  opt.value === preset ? " selected" : ""
-                }>${opt.label}</option>`,
-              )
-              .join("")}
+            ${rangeOptionsHtml}
           </select>
 
           <span style="font-size:13px; margin-left:8px;">Basis:</span>
           <select name="basis" onchange="this.form.submit()">
-            ${basisOptions
-              .map(
-                (opt) => `<option value="${opt.value}"${
-                  opt.value === basis ? " selected" : ""
-                }>${opt.label}</option>`,
-              )
-              .join("")}
+            ${basisOptionsHtml}
           </select>
 
           <input type="hidden" name="realmId" value="${realmId}" />
@@ -810,12 +786,12 @@ export default async function handler(req, res) {
           href="data:text/csv;base64,${csvBase64}"
           download="nexus_txns_${startStr}_${endStr}_${basis}.csv"
         >
-          Download CSV (transactions used in this report)
+          Download CSV (transactions used)
         </a>
       </div>
 
       <div class="text-muted" style="margin-bottom:10px;">
-        Each row below is based on the same Invoices + Sales Receipts that feed the CSV file.
+        Each state row is based on the exact same Invoices + Sales Receipts contained in the CSV.
       </div>
 
       <div style="overflow-x:auto;">
@@ -830,60 +806,14 @@ export default async function handler(req, res) {
             </tr>
           </thead>
           <tbody>
-            ${
-              rowsWithRisk.length === 0
-                ? `<tr><td colspan="5" class="text-muted" style="padding:14px;">No Invoice or Sales Receipt data found in this period.</td></tr>`
-                : rowsWithRisk
-                    .map((row) => {
-                      const badgeClass =
-                        row.severity === "high"
-                          ? "badge-high"
-                          : row.severity === "medium"
-                          ? "badge-medium"
-                          : row.severity === "low"
-                          ? "badge-low"
-                          : row.severity === "info"
-                          ? "badge-info"
-                          : "badge-none";
-
-                      const noteParts = [];
-                      if (row.rule?.noStateSalesTax) {
-                        noteParts.push("No state-level sales tax.");
-                      }
-                      if (row.thresholdLabel && !row.rule?.noStateSalesTax) {
-                        noteParts.push("Threshold: " + row.thresholdLabel + ".");
-                      }
-                      if (row.rule?.notes) {
-                        noteParts.push(row.rule.notes);
-                      }
-                      const noteText = noteParts.join(" ");
-
-                      return `
-                        <tr>
-                          <td>${row.state}</td>
-                          <td class="text-right">${row.orders}</td>
-                          <td class="text-right">${formatMoney(row.sales)}</td>
-                          <td class="text-right">${formatMoney(row.avgOrder)}</td>
-                          <td>
-                            <span class="badge ${badgeClass}" title="${noteText.replace(
-                              /"/g,
-                              "&quot;",
-                            )}">
-                              ${row.risk}
-                            </span>
-                          </td>
-                        </tr>
-                      `;
-                    })
-                    .join("")
-            }
+            ${rowsHtml}
           </tbody>
         </table>
       </div>
 
       <details>
         <summary>Debug info (UT / N/A samples)</summary>
-        <pre>${JSON.stringify(debugSample, null, 2)}</pre>
+        <pre>${debugJson}</pre>
       </details>
     </section>
   </div>
